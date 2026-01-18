@@ -88,6 +88,12 @@ const ManageDriftPage = () => {
     queryKey: "ListDriftTemplates",
   });
 
+  // API call to get all Intune templates for displayName lookup
+  const intuneTemplatesApi = ApiGetCall({
+    url: "/api/ListIntuneTemplates",
+    queryKey: "ListIntuneTemplates",
+  });
+
   // API call for standards comparison (when templateId is available)
   const comparisonApi = ApiGetCall({
     url: "/api/ListStandardsCompare",
@@ -124,7 +130,7 @@ const ManageDriftPage = () => {
       }
       if (item.customerSpecificDeviations && Array.isArray(item.customerSpecificDeviations)) {
         acc.customerSpecificDeviationsList.push(
-          ...item.customerSpecificDeviations.filter((dev) => dev !== null)
+          ...item.customerSpecificDeviations.filter((dev) => dev !== null),
         );
       }
       if (item.deniedDeviations && Array.isArray(item.deniedDeviations)) {
@@ -137,52 +143,75 @@ const ManageDriftPage = () => {
         Array.isArray(item.driftSettings.ComparisonDetails)
       ) {
         const compliantStandards = item.driftSettings.ComparisonDetails.filter(
-          (detail) => detail.Compliant === true
-        ).map((detail) => {
-          // Strip "standards." prefix if present
-          let standardName = detail.StandardName;
-          if (standardName.startsWith("standards.")) {
-            standardName = standardName.substring("standards.".length);
-          }
-
-          let displayName = null;
-
-          // For template types, extract the display name from standardSettings
-          if (standardName.startsWith("IntuneTemplate.")) {
-            const guid = standardName.substring("IntuneTemplate.".length);
-            const intuneTemplates = item.driftSettings?.standardSettings?.IntuneTemplate;
-            if (Array.isArray(intuneTemplates)) {
-              const template = intuneTemplates.find((t) => t.TemplateList?.value === guid);
-              if (template?.TemplateList?.label) {
-                displayName = template.TemplateList.label;
-              }
+          (detail) => detail.Compliant === true,
+        )
+          .map((detail) => {
+            // Strip "standards." prefix if present
+            let standardName = detail.StandardName;
+            if (standardName.startsWith("standards.")) {
+              standardName = standardName.substring("standards.".length);
             }
-          } else if (standardName.startsWith("ConditionalAccessTemplate.")) {
-            const guid = standardName.substring("ConditionalAccessTemplate.".length);
-            const caTemplates = item.driftSettings?.standardSettings?.ConditionalAccessTemplate;
-            if (Array.isArray(caTemplates)) {
-              const template = caTemplates.find((t) => t.TemplateList?.value === guid);
-              if (template?.TemplateList?.label) {
-                displayName = template.TemplateList.label;
-              }
-            }
-          } else {
-            // For non-template standards, keep the "standards." prefix for lookup
-            standardName = detail.StandardName;
-          }
 
-          return {
-            standardName: standardName,
-            standardDisplayName: displayName, // Set display name if found from templates
-            state: "aligned",
-            Status: "Aligned",
-            ComplianceStatus: detail.ComplianceStatus,
-            StandardValue: detail.StandardValue,
-            ReportingDisabled: detail.ReportingDisabled,
-            expectedValue: "Compliant with template",
-            receivedValue: detail.StandardValue,
-          };
-        });
+            let displayName = null;
+
+            // For template types, extract the display name from standardSettings
+            if (standardName.startsWith("IntuneTemplate.")) {
+              const guid = standardName.substring("IntuneTemplate.".length);
+
+              // First try to find in standardSettings
+              const intuneTemplates = item.driftSettings?.standardSettings?.IntuneTemplate;
+              if (Array.isArray(intuneTemplates)) {
+                const template = intuneTemplates.find((t) => t.TemplateList?.value === guid);
+                if (template?.TemplateList?.label) {
+                  displayName = template.TemplateList.label;
+                }
+              }
+
+              // If not found in standardSettings, look up in all Intune templates (for tag templates)
+              if (!displayName && intuneTemplatesApi.data) {
+                const template = intuneTemplatesApi.data.find((t) => t.GUID === guid);
+                if (template?.Displayname) {
+                  displayName = template.Displayname;
+                }
+              }
+
+              // If template not found, return null to filter it out later
+              if (!displayName) {
+                return null;
+              }
+            } else if (standardName.startsWith("ConditionalAccessTemplate.")) {
+              const guid = standardName.substring("ConditionalAccessTemplate.".length);
+              const caTemplates = item.driftSettings?.standardSettings?.ConditionalAccessTemplate;
+              if (Array.isArray(caTemplates)) {
+                const template = caTemplates.find((t) => t.TemplateList?.value === guid);
+                if (template?.TemplateList?.label) {
+                  displayName = template.TemplateList.label;
+                }
+              }
+              // If template not found, return null to filter it out later
+              if (!displayName) {
+                return null;
+              }
+            } else {
+              // For non-template standards, keep the "standards." prefix for lookup
+              standardName = detail.StandardName;
+            }
+
+            return {
+              standardName: standardName,
+              standardDisplayName: displayName, // Set display name if found from templates
+              state: "aligned",
+              Status: "Aligned",
+              ComplianceStatus: detail.ComplianceStatus,
+              StandardValue: detail.StandardValue,
+              ReportingDisabled: detail.ReportingDisabled,
+              ExpectedValue: detail.ExpectedValue,
+              CurrentValue: detail.CurrentValue,
+              expectedValue: detail.ExpectedValue || "Compliant with template",
+              receivedValue: detail.CurrentValue || detail.StandardValue,
+            };
+          })
+          .filter((item) => item !== null); // Filter out null items where templates weren't found
         acc.alignedStandards.push(...compliantStandards);
       }
 
@@ -209,7 +238,7 @@ const ManageDriftPage = () => {
       deniedDeviationsList: [],
       alignedStandards: [],
       latestDataCollection: null,
-    }
+    },
   );
 
   // Transform currentDeviations into deviation items for display
@@ -313,6 +342,82 @@ const ManageDriftPage = () => {
     return null;
   };
 
+  // Helper function to compare JSON objects and find differences
+  const compareJsonObjects = (expected, current) => {
+    if (!expected || !current) return null;
+
+    try {
+      const expectedObj = typeof expected === "string" ? JSON.parse(expected) : expected;
+      const currentObj = typeof current === "string" ? JSON.parse(current) : current;
+
+      // Deep comparison - if they're equal, return null (no diff)
+      if (JSON.stringify(expectedObj) === JSON.stringify(currentObj)) {
+        return null; // No differences
+      }
+
+      // Find differences
+      const differences = {};
+      const allKeys = new Set([...Object.keys(expectedObj), ...Object.keys(currentObj)]);
+
+      allKeys.forEach((key) => {
+        const expectedVal = expectedObj[key];
+        const currentVal = currentObj[key];
+
+        if (JSON.stringify(expectedVal) !== JSON.stringify(currentVal)) {
+          differences[key] = {
+            expected: expectedVal,
+            current: currentVal,
+          };
+        }
+      });
+
+      return Object.keys(differences).length > 0 ? differences : null;
+    } catch (e) {
+      console.error("Error comparing JSON objects:", e);
+      return null;
+    }
+  };
+
+  // Helper function to format differences for display
+  const formatDifferences = (differences) => {
+    if (!differences || typeof differences !== "object") return null;
+
+    const formatted = [];
+    Object.entries(differences).forEach(([key, value]) => {
+      formatted.push({
+        property: key,
+        expected:
+          value.expected !== undefined ? JSON.stringify(value.expected, null, 2) : "Not set",
+        current: value.current !== undefined ? JSON.stringify(value.current, null, 2) : "Not set",
+      });
+    });
+
+    return formatted;
+  };
+
+  // Helper function to format matching properties for compliant items
+  const formatCompliantProperties = (value) => {
+    if (!value) return null;
+
+    try {
+      const obj = typeof value === "string" ? JSON.parse(value) : value;
+
+      if (typeof obj !== "object" || obj === null) return null;
+
+      const formatted = [];
+      Object.entries(obj).forEach(([key, val]) => {
+        formatted.push({
+          property: key,
+          value: val !== undefined ? JSON.stringify(val, null, 2) : "Not set",
+        });
+      });
+
+      return formatted.length > 0 ? formatted : null;
+    } catch (e) {
+      return null;
+    }
+  };
+
   // Helper function to format policy objects for display
   const formatPolicyValue = (value) => {
     if (!value) return "N/A";
@@ -339,78 +444,625 @@ const ManageDriftPage = () => {
 
   // Helper function to create deviation items
   const createDeviationItems = (deviations, statusOverride = null) => {
-    return (deviations || []).map((deviation, index) => {
-      // Prioritize standardDisplayName from drift data (which has user-friendly names for templates)
-      // then fallback to standards.json lookup, then raw name
-      const prettyName =
-        deviation.standardDisplayName ||
-        getStandardPrettyName(deviation.standardName) ||
-        deviation.standardName ||
-        "Unknown Standard";
+    return (deviations || [])
+      .filter((deviation) => {
+        // Filter out template deviations where the template cannot be found
+        // (these will have null/undefined standardDisplayName)
+        if (
+          deviation.standardName &&
+          (deviation.standardName.startsWith("IntuneTemplate.") ||
+            deviation.standardName.startsWith("ConditionalAccessTemplate."))
+        ) {
+          // For templates, we must have a standardDisplayName
+          return !!deviation.standardDisplayName;
+        }
+        // For non-template standards, always include
+        return true;
+      })
+      .map((deviation, index) => {
+        // Check if this should be skipped due to missing license
+        const isLicenseSkipped = deviation.LicenseAvailable === false;
 
-      // Get description from standards.json first, then fallback to standardDescription from deviation
-      const description =
-        getStandardDescription(deviation.standardName) ||
-        deviation.standardDescription ||
-        "No description available";
+        // Check if we have both ExpectedValue and CurrentValue for comparison
+        let isActuallyCompliant = false;
+        let jsonDifferences = null;
 
-      return {
-        id: statusOverride ? `${statusOverride}-${index + 1}` : `current-${index + 1}`,
-        cardLabelBox: {
-          cardLabelBoxHeader: getDeviationIcon(
-            statusOverride || deviation.Status || deviation.state
+        if (deviation.ExpectedValue && deviation.CurrentValue) {
+          jsonDifferences = compareJsonObjects(deviation.ExpectedValue, deviation.CurrentValue);
+          // If there are no differences, this is actually compliant
+          if (jsonDifferences === null) {
+            isActuallyCompliant = true;
+          }
+        }
+
+        // Prioritize standardDisplayName from drift data (which has user-friendly names for templates)
+        // then fallback to standards.json lookup, then raw name
+        const prettyName =
+          deviation.standardDisplayName ||
+          getStandardPrettyName(deviation.standardName) ||
+          deviation.standardName ||
+          "Unknown Standard";
+
+        // Get description from standards.json first, then fallback to standardDescription from deviation
+        const description =
+          getStandardDescription(deviation.standardName) ||
+          deviation.standardDescription ||
+          "No description available";
+
+        // Determine the actual status
+        // If actually compliant (values match), mark as aligned regardless of input status
+        // If license is skipped, mark as skipped
+        // Otherwise use the provided status
+        const actualStatus = isActuallyCompliant
+          ? "aligned"
+          : isLicenseSkipped
+            ? "skipped"
+            : statusOverride || deviation.Status || deviation.state;
+        const actualStatusText = isActuallyCompliant
+          ? "Compliant"
+          : isLicenseSkipped
+            ? "Skipped - No License Available"
+            : getDeviationStatusText(actualStatus);
+
+        // For skipped items, show different expected/received values
+        let displayExpectedValue = deviation.ExpectedValue || deviation.expectedValue;
+        let displayReceivedValue = deviation.CurrentValue || deviation.receivedValue;
+
+        // If we have JSON differences, format them for display
+        let formattedDifferences = null;
+        let formattedCompliantProps = null;
+
+        if (jsonDifferences && !isLicenseSkipped && !isActuallyCompliant) {
+          formattedDifferences = formatDifferences(jsonDifferences);
+        } else if ((isActuallyCompliant || actualStatus === "aligned") && displayExpectedValue) {
+          // For compliant items, format the properties to show them matching
+          formattedCompliantProps = formatCompliantProperties(displayExpectedValue);
+        }
+
+        return {
+          id: statusOverride ? `${statusOverride}-${index + 1}` : `current-${index + 1}`,
+          cardLabelBox: {
+            cardLabelBoxHeader: getDeviationIcon(actualStatus),
+          },
+          text: prettyName,
+          subtext: description,
+          statusColor: isLicenseSkipped ? "text.secondary" : getDeviationColor(actualStatus),
+          statusText: actualStatusText,
+          standardName: deviation.standardName, // Store the original standardName for action handlers
+          receivedValue: deviation.receivedValue, // Store the original receivedValue for action handlers
+          expectedValue: deviation.expectedValue, // Store the original expectedValue for action handlers
+          originalDeviation: deviation, // Store the complete original deviation object for reference
+          isLicenseSkipped: isLicenseSkipped, // Flag for filtering and disabling actions
+          isActuallyCompliant: isActuallyCompliant, // Flag to move to compliant section
+          children: (
+            <Stack spacing={2} sx={{ p: 2 }}>
+              {description && description !== "No description available" && (
+                <Typography variant="body2" color="text.secondary">
+                  {description}
+                </Typography>
+              )}
+
+              {isLicenseSkipped && (
+                <Box
+                  sx={{
+                    p: 1.5,
+                    bgcolor: "warning.lighter",
+                    borderRadius: 1,
+                    border: "1px solid",
+                    borderColor: "warning.main",
+                  }}
+                >
+                  <Typography variant="body2" color="warning.dark" sx={{ fontWeight: 600 }}>
+                    ⚠️ This standard was skipped because the required license is not available for
+                    this tenant.
+                  </Typography>
+                </Box>
+              )}
+
+              {formattedDifferences && formattedDifferences.length > 0 ? (
+                <Stack spacing={2}>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      fontWeight: 600,
+                      color: "text.secondary",
+                      textTransform: "uppercase",
+                      letterSpacing: 0.5,
+                    }}
+                  >
+                    Property Differences
+                  </Typography>
+                  {formattedDifferences.map((diff, idx) => (
+                    <Box key={idx} sx={{ mb: 2 }}>
+                      <Typography
+                        variant="subtitle2"
+                        sx={{
+                          fontWeight: 600,
+                          mb: 1,
+                          color: "primary.main",
+                        }}
+                      >
+                        {diff.property}
+                      </Typography>
+                      <Box
+                        sx={{ display: "flex", gap: 2, flexDirection: { xs: "column", sm: "row" } }}
+                      >
+                        <Box sx={{ flex: 1, minWidth: 0 }}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              fontWeight: 600,
+                              color: "text.secondary",
+                              textTransform: "uppercase",
+                              letterSpacing: 0.5,
+                              display: "block",
+                              mb: 0.5,
+                            }}
+                          >
+                            Expected
+                          </Typography>
+                          <Box
+                            sx={{
+                              p: 1.5,
+                              bgcolor: "success.lighter",
+                              borderRadius: "12px",
+                              border: "2px solid",
+                              borderColor: "success.main",
+                              position: "relative",
+                            }}
+                          >
+                            <Box
+                              sx={{
+                                position: "absolute",
+                                top: -8,
+                                right: -8,
+                                width: 24,
+                                height: 24,
+                                borderRadius: "50%",
+                                bgcolor: "success.main",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <Check sx={{ color: "white", fontSize: 16 }} />
+                            </Box>
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                fontFamily: "monospace",
+                                fontSize: "0.8125rem",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                color: "success.dark",
+                              }}
+                            >
+                              {diff.expected}
+                            </Typography>
+                          </Box>
+                        </Box>
+                        <Box sx={{ flex: 1, minWidth: 0 }}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              fontWeight: 600,
+                              color: "text.secondary",
+                              textTransform: "uppercase",
+                              letterSpacing: 0.5,
+                              display: "block",
+                              mb: 0.5,
+                            }}
+                          >
+                            Current
+                          </Typography>
+                          <Box
+                            sx={{
+                              p: 1.5,
+                              bgcolor: "error.lighter",
+                              borderRadius: "12px",
+                              border: "2px solid",
+                              borderColor: "error.main",
+                              position: "relative",
+                            }}
+                          >
+                            <Box
+                              sx={{
+                                position: "absolute",
+                                top: -8,
+                                right: -8,
+                                width: 24,
+                                height: 24,
+                                borderRadius: "50%",
+                                bgcolor: "error.main",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <Cancel sx={{ color: "white", fontSize: 16 }} />
+                            </Box>
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                fontFamily: "monospace",
+                                fontSize: "0.8125rem",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                color: "error.dark",
+                              }}
+                            >
+                              {diff.current}
+                            </Typography>
+                          </Box>
+                        </Box>
+                      </Box>
+                    </Box>
+                  ))}
+                </Stack>
+              ) : formattedCompliantProps && formattedCompliantProps.length > 0 ? (
+                <Stack spacing={2}>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      fontWeight: 600,
+                      color: "text.secondary",
+                      textTransform: "uppercase",
+                      letterSpacing: 0.5,
+                    }}
+                  >
+                    Compliant Properties
+                  </Typography>
+                  {formattedCompliantProps.map((prop, idx) => (
+                    <Box key={idx} sx={{ mb: 2 }}>
+                      <Typography
+                        variant="subtitle2"
+                        sx={{
+                          fontWeight: 600,
+                          mb: 1,
+                          color: "success.main",
+                        }}
+                      >
+                        {prop.property}
+                      </Typography>
+                      <Box
+                        sx={{ display: "flex", gap: 2, flexDirection: { xs: "column", sm: "row" } }}
+                      >
+                        <Box sx={{ flex: 1, minWidth: 0 }}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              fontWeight: 600,
+                              color: "text.secondary",
+                              textTransform: "uppercase",
+                              letterSpacing: 0.5,
+                              display: "block",
+                              mb: 0.5,
+                            }}
+                          >
+                            Expected
+                          </Typography>
+                          <Box
+                            sx={{
+                              p: 1.5,
+                              bgcolor: "success.lighter",
+                              borderRadius: "12px",
+                              border: "2px solid",
+                              borderColor: "success.main",
+                              position: "relative",
+                            }}
+                          >
+                            <Box
+                              sx={{
+                                position: "absolute",
+                                top: -8,
+                                right: -8,
+                                width: 24,
+                                height: 24,
+                                borderRadius: "50%",
+                                bgcolor: "success.main",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <Check sx={{ color: "white", fontSize: 16 }} />
+                            </Box>
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                fontFamily: "monospace",
+                                fontSize: "0.8125rem",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                color: "success.dark",
+                              }}
+                            >
+                              {prop.value}
+                            </Typography>
+                          </Box>
+                        </Box>
+                        <Box sx={{ flex: 1, minWidth: 0 }}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              fontWeight: 600,
+                              color: "text.secondary",
+                              textTransform: "uppercase",
+                              letterSpacing: 0.5,
+                              display: "block",
+                              mb: 0.5,
+                            }}
+                          >
+                            Current
+                          </Typography>
+                          <Box
+                            sx={{
+                              p: 1.5,
+                              bgcolor: "success.lighter",
+                              borderRadius: "12px",
+                              border: "2px solid",
+                              borderColor: "success.main",
+                              position: "relative",
+                            }}
+                          >
+                            <Box
+                              sx={{
+                                position: "absolute",
+                                top: -8,
+                                right: -8,
+                                width: 24,
+                                height: 24,
+                                borderRadius: "50%",
+                                bgcolor: "success.main",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <Check sx={{ color: "white", fontSize: 16 }} />
+                            </Box>
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                fontFamily: "monospace",
+                                fontSize: "0.8125rem",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                color: "success.dark",
+                              }}
+                            >
+                              {prop.value}
+                            </Typography>
+                          </Box>
+                        </Box>
+                      </Box>
+                    </Box>
+                  ))}
+                </Stack>
+              ) : displayExpectedValue || displayReceivedValue ? (
+                <Box sx={{ display: "flex", gap: 2, flexDirection: { xs: "column", sm: "row" } }}>
+                  {displayExpectedValue && (
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          fontWeight: 600,
+                          color: "text.secondary",
+                          textTransform: "uppercase",
+                          letterSpacing: 0.5,
+                          display: "block",
+                          mb: 0.5,
+                        }}
+                      >
+                        Expected
+                      </Typography>
+                      <Box
+                        sx={{
+                          p: 1.5,
+                          bgcolor:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "success.lighter"
+                              : "action.hover",
+                          borderRadius:
+                            isActuallyCompliant || actualStatus === "aligned" ? "12px" : 1,
+                          border:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "2px solid"
+                              : "1px solid",
+                          borderColor:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "success.main"
+                              : "divider",
+                          position: "relative",
+                        }}
+                      >
+                        {(isActuallyCompliant || actualStatus === "aligned") && (
+                          <Box
+                            sx={{
+                              position: "absolute",
+                              top: -8,
+                              right: -8,
+                              width: 24,
+                              height: 24,
+                              borderRadius: "50%",
+                              bgcolor: "success.main",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            <Check sx={{ color: "white", fontSize: 16 }} />
+                          </Box>
+                        )}
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            fontFamily: "monospace",
+                            fontSize: "0.8125rem",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                            color:
+                              isActuallyCompliant || actualStatus === "aligned"
+                                ? "success.dark"
+                                : "text.primary",
+                          }}
+                        >
+                          {displayExpectedValue === "Compliant with template"
+                            ? displayReceivedValue || "Compliant"
+                            : displayExpectedValue}
+                        </Typography>
+                      </Box>
+                    </Box>
+                  )}
+
+                  {displayReceivedValue && (
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          fontWeight: 600,
+                          color: "text.secondary",
+                          textTransform: "uppercase",
+                          letterSpacing: 0.5,
+                          display: "block",
+                          mb: 0.5,
+                        }}
+                      >
+                        Current
+                      </Typography>
+                      <Box
+                        sx={{
+                          p: 1.5,
+                          bgcolor:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "success.lighter"
+                              : "action.hover",
+                          borderRadius:
+                            isActuallyCompliant || actualStatus === "aligned" ? "12px" : 1,
+                          border:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "2px solid"
+                              : "1px solid",
+                          borderColor:
+                            isActuallyCompliant || actualStatus === "aligned"
+                              ? "success.main"
+                              : "divider",
+                          position: "relative",
+                        }}
+                      >
+                        {(isActuallyCompliant || actualStatus === "aligned") && (
+                          <Box
+                            sx={{
+                              position: "absolute",
+                              top: -8,
+                              right: -8,
+                              width: 24,
+                              height: 24,
+                              borderRadius: "50%",
+                              bgcolor: "success.main",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            <Check sx={{ color: "white", fontSize: 16 }} />
+                          </Box>
+                        )}
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            fontFamily: "monospace",
+                            fontSize: "0.8125rem",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                            color:
+                              isActuallyCompliant || actualStatus === "aligned"
+                                ? "success.dark"
+                                : "text.primary",
+                          }}
+                        >
+                          {displayReceivedValue}
+                        </Typography>
+                      </Box>
+                    </Box>
+                  )}
+                </Box>
+              ) : null}
+
+              {(deviation.Reason ||
+                deviation.lastChangedByUser ||
+                processedDriftData.latestDataCollection) && (
+                <>
+                  <Divider />
+                  <Box sx={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
+                    {deviation.Reason && (
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography
+                          variant="caption"
+                          sx={{ fontWeight: 600, color: "text.secondary" }}
+                        >
+                          Reason
+                        </Typography>
+                        <Typography variant="body2">{deviation.Reason}</Typography>
+                      </Box>
+                    )}
+                    {deviation.lastChangedByUser && (
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography
+                          variant="caption"
+                          sx={{ fontWeight: 600, color: "text.secondary" }}
+                        >
+                          Changed By
+                        </Typography>
+                        <Typography variant="body2">{deviation.lastChangedByUser}</Typography>
+                      </Box>
+                    )}
+                    {processedDriftData.latestDataCollection && (
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography
+                          variant="caption"
+                          sx={{ fontWeight: 600, color: "text.secondary" }}
+                        >
+                          Last Updated
+                        </Typography>
+                        <Typography variant="body2">
+                          {new Date(processedDriftData.latestDataCollection).toLocaleString()}
+                        </Typography>
+                      </Box>
+                    )}
+                  </Box>
+                </>
+              )}
+            </Stack>
           ),
-        },
-        text: prettyName,
-        subtext: description,
-        statusColor: getDeviationColor(statusOverride || deviation.Status || deviation.state),
-        statusText: getDeviationStatusText(statusOverride || deviation.Status || deviation.state),
-        standardName: deviation.standardName, // Store the original standardName for action handlers
-        receivedValue: deviation.receivedValue, // Store the original receivedValue for action handlers
-        expectedValue: deviation.expectedValue, // Store the original expectedValue for action handlers
-        originalDeviation: deviation, // Store the complete original deviation object for reference
-        propertyItems: [
-          { label: "Standard Name", value: prettyName },
-          { label: "Description", value: description },
-          { label: "Expected Value", value: deviation.expectedValue || "N/A" },
-          { label: "Current Value", value: formatPolicyValue(deviation.receivedValue) },
-          {
-            label: "Status",
-            value: getDeviationStatusText(statusOverride || deviation.Status || deviation.state),
-          },
-          {
-            label: "Reason",
-            value: deviation.Reason || "N/A",
-          },
-          {
-            label: "User",
-            value: deviation.lastChangedByUser || "N/A",
-          },
-          {
-            label: "Last Updated",
-            value: processedDriftData.latestDataCollection
-              ? new Date(processedDriftData.latestDataCollection).toLocaleString()
-              : "N/A",
-          },
-        ].filter((item) => item.value !== "N/A" && item.value !== "No description available"), // Filter out N/A values and empty descriptions
-      };
-    });
+        };
+      });
   };
 
   const deviationItems = createDeviationItems(processedDriftData.currentDeviations);
   const acceptedDeviationItems = createDeviationItems(
     processedDriftData.acceptedDeviations,
-    "accepted"
+    "accepted",
   );
   const customerSpecificDeviationItems = createDeviationItems(
     processedDriftData.customerSpecificDeviationsList,
-    "customerspecific"
+    "customerspecific",
   );
   const deniedDeviationItems = createDeviationItems(
     processedDriftData.deniedDeviationsList,
-    "denied"
+    "denied",
   );
   const alignedStandardItems = createDeviationItems(processedDriftData.alignedStandards, "aligned");
+
+  // Separate items by their actual status
+  const licenseSkippedItems = deviationItems.filter((item) => item.isLicenseSkipped);
+  const compliantFromDeviations = deviationItems.filter((item) => item.isActuallyCompliant);
+  const actualDeviationItems = deviationItems.filter(
+    (item) => !item.isLicenseSkipped && !item.isActuallyCompliant,
+  );
+
+  // Combine compliant items from both sources
+  const allAlignedItems = [...alignedStandardItems, ...compliantFromDeviations];
 
   const handleMenuClick = (event, itemId) => {
     setAnchorEl((prev) => ({ ...prev, [itemId]: event.currentTarget }));
@@ -628,7 +1280,7 @@ const ManageDriftPage = () => {
 
   // Find current tenant data
   const currentTenantData = currentTenantInfo.data?.find(
-    (tenant) => tenant.defaultDomainName === tenantFilter
+    (tenant) => tenant.defaultDomainName === tenantFilter,
   );
 
   // Actions for the ActionsMenu
@@ -664,140 +1316,61 @@ const ManageDriftPage = () => {
   }, [templateId]);
 
   // Add action buttons to each deviation item
-  const deviationItemsWithActions = deviationItems.map((item) => {
-    // Check if this is a template that supports delete action
-    const supportsDelete =
-      (item.standardName?.includes("ConditionalAccessTemplate") ||
-        item.standardName?.includes("IntuneTemplate")) &&
-      item.expectedValue === "This policy only exists in the tenant, not in the template.";
-
+  const deviationItemsWithActions = actualDeviationItems.map((item) => {
     return {
       ...item,
-      actionButton: (
-        <>
-          <Button
-            variant="outlined"
-            endIcon={<ExpandMore />}
-            onClick={(e) => handleMenuClick(e, item.id)}
-            size="small"
-          >
-            Actions
-          </Button>
-          <Menu
-            anchorEl={anchorEl[item.id]}
-            open={Boolean(anchorEl[item.id])}
-            onClose={() => handleMenuClose(item.id)}
-          >
-            <MenuItem onClick={() => handleAction("accept-customer-specific", item.id)}>
-              <CheckCircle sx={{ mr: 1, color: "success.main" }} />
-              Accept Deviation - Customer Specific
-            </MenuItem>
-            <MenuItem onClick={() => handleAction("accept", item.id)}>
-              <Check sx={{ mr: 1, color: "info.main" }} />
-              Accept Deviation
-            </MenuItem>
-            {supportsDelete && (
-              <MenuItem onClick={() => handleAction("deny-delete", item.id)}>
-                <Block sx={{ mr: 1, color: "error.main" }} />
-                Deny Deviation - Delete Policy
-              </MenuItem>
-            )}
-            <MenuItem onClick={() => handleAction("deny-remediate", item.id)}>
-              <Cancel sx={{ mr: 1, color: "error.main" }} />
-              Deny Deviation - Remediate to align with template
-            </MenuItem>
-          </Menu>
-        </>
+      cardLabelBoxActions: (
+        <Button
+          variant="outlined"
+          endIcon={<ExpandMore />}
+          onClick={(e) => {
+            e.stopPropagation();
+            handleMenuClick(e, item.id);
+          }}
+          size="small"
+        >
+          Actions
+        </Button>
       ),
     };
   });
 
   // Add action buttons to accepted deviation items
   const acceptedDeviationItemsWithActions = acceptedDeviationItems.map((item) => {
-    // Check if this is a template that supports delete action
-    const supportsDelete =
-      (item.standardName?.includes("ConditionalAccessTemplate") ||
-        item.standardName?.includes("IntuneTemplate")) &&
-      item.expectedValue === "This policy only exists in the tenant, not in the template.";
-
     return {
       ...item,
-      actionButton: (
-        <>
-          <Button
-            variant="outlined"
-            endIcon={<ExpandMore />}
-            onClick={(e) => handleMenuClick(e, `accepted-${item.id}`)}
-            size="small"
-          >
-            Actions
-          </Button>
-          <Menu
-            anchorEl={anchorEl[`accepted-${item.id}`]}
-            open={Boolean(anchorEl[`accepted-${item.id}`])}
-            onClose={() => handleMenuClose(`accepted-${item.id}`)}
-          >
-            {supportsDelete && (
-              <MenuItem onClick={() => handleDeviationAction("deny-delete", item)}>
-                <Block sx={{ mr: 1, color: "error.main" }} />
-                Deny - Delete Policy
-              </MenuItem>
-            )}
-            <MenuItem onClick={() => handleDeviationAction("deny-remediate", item)}>
-              <Cancel sx={{ mr: 1, color: "error.main" }} />
-              Deny - Remediate to align with template
-            </MenuItem>
-            <MenuItem onClick={() => handleDeviationAction("accept-customer-specific", item)}>
-              <CheckCircle sx={{ mr: 1, color: "info.main" }} />
-              Accept - Customer Specific
-            </MenuItem>
-          </Menu>
-        </>
+      cardLabelBoxActions: (
+        <Button
+          variant="outlined"
+          endIcon={<ExpandMore />}
+          onClick={(e) => {
+            e.stopPropagation();
+            handleMenuClick(e, `accepted-${item.id}`);
+          }}
+          size="small"
+        >
+          Actions
+        </Button>
       ),
     };
   });
 
   // Add action buttons to customer specific deviation items
   const customerSpecificDeviationItemsWithActions = customerSpecificDeviationItems.map((item) => {
-    // Check if this is a template that supports delete action
-    const supportsDelete =
-      (item.standardName?.includes("ConditionalAccessTemplate") ||
-        item.standardName?.includes("IntuneTemplate")) &&
-      item.expectedValue === "This policy only exists in the tenant, not in the template.";
-
     return {
       ...item,
-      actionButton: (
-        <>
-          <Button
-            variant="outlined"
-            endIcon={<ExpandMore />}
-            onClick={(e) => handleMenuClick(e, `customer-${item.id}`)}
-            size="small"
-          >
-            Actions
-          </Button>
-          <Menu
-            anchorEl={anchorEl[`customer-${item.id}`]}
-            open={Boolean(anchorEl[`customer-${item.id}`])}
-            onClose={() => handleMenuClose(`customer-${item.id}`)}
-          >
-            {supportsDelete && (
-              <MenuItem onClick={() => handleDeviationAction("deny-delete", item)}>
-                <Block sx={{ mr: 1, color: "error.main" }} />
-                Deny - Delete
-              </MenuItem>
-            )}
-            <MenuItem onClick={() => handleDeviationAction("deny-remediate", item)}>
-              <Cancel sx={{ mr: 1, color: "error.main" }} />
-              Deny - Remediate to align with template
-            </MenuItem>
-            <MenuItem onClick={() => handleDeviationAction("accept", item)}>
-              <Check sx={{ mr: 1, color: "success.main" }} />
-              Accept
-            </MenuItem>
-          </Menu>
-        </>
+      cardLabelBoxActions: (
+        <Button
+          variant="outlined"
+          endIcon={<ExpandMore />}
+          onClick={(e) => {
+            e.stopPropagation();
+            handleMenuClick(e, `customer-${item.id}`);
+          }}
+          size="small"
+        >
+          Actions
+        </Button>
       ),
     };
   });
@@ -805,35 +1378,23 @@ const ManageDriftPage = () => {
   // Add action buttons to denied deviation items
   const deniedDeviationItemsWithActions = deniedDeviationItems.map((item) => ({
     ...item,
-    actionButton: (
-      <>
-        <Button
-          variant="outlined"
-          endIcon={<ExpandMore />}
-          onClick={(e) => handleMenuClick(e, `denied-${item.id}`)}
-          size="small"
-        >
-          Actions
-        </Button>
-        <Menu
-          anchorEl={anchorEl[`denied-${item.id}`]}
-          open={Boolean(anchorEl[`denied-${item.id}`])}
-          onClose={() => handleMenuClose(`denied-${item.id}`)}
-        >
-          <MenuItem onClick={() => handleDeviationAction("accept", item)}>
-            <Check sx={{ mr: 1, color: "success.main" }} />
-            Accept
-          </MenuItem>
-          <MenuItem onClick={() => handleDeviationAction("accept-customer-specific", item)}>
-            <CheckCircle sx={{ mr: 1, color: "info.main" }} />
-            Accept - Customer Specific
-          </MenuItem>
-        </Menu>
-      </>
+    cardLabelBoxActions: (
+      <Button
+        variant="outlined"
+        endIcon={<ExpandMore />}
+        onClick={(e) => {
+          e.stopPropagation();
+          handleMenuClick(e, `denied-${item.id}`);
+        }}
+        size="small"
+      >
+        Actions
+      </Button>
     ),
   }));
 
   // Calculate compliance metrics for badges
+  // Accepted and Customer Specific deviations count as compliant since they are user-approved
   // Denied deviations are included in total but not in compliant count (they haven't been fixed yet)
   const totalPolicies =
     processedDriftData.alignedCount +
@@ -842,10 +1403,20 @@ const ManageDriftPage = () => {
     processedDriftData.customerSpecificDeviations +
     processedDriftData.deniedDeviationsCount;
 
-  const compliancePercentage =
-    totalPolicies > 0 ? Math.round((processedDriftData.alignedCount / totalPolicies) * 100) : 0;
+  const compliantCount =
+    processedDriftData.alignedCount +
+    processedDriftData.acceptedDeviationsCount +
+    processedDriftData.customerSpecificDeviations;
 
-  const missingLicensePercentage = 0; // This would need to be calculated from actual license data
+  // Alignment Score: Only actual compliance (excluding license-missing items)
+  const compliancePercentage =
+    totalPolicies > 0 ? Math.round((compliantCount / totalPolicies) * 100) : 0;
+
+  // Calculate missing license percentage
+  const missingLicensePercentage =
+    totalPolicies > 0 ? Math.round((licenseSkippedItems.length / totalPolicies) * 100) : 0;
+
+  // Total Score: Alignment + License Missing (represents addressable compliance)
   const combinedScore = compliancePercentage + missingLicensePercentage;
 
   // Helper function to get category from standardName
@@ -872,7 +1443,7 @@ const ManageDriftPage = () => {
         (item) =>
           item.text?.toLowerCase().includes(searchQuery.toLowerCase()) ||
           item.subtext?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          item.standardName?.toLowerCase().includes(searchQuery.toLowerCase())
+          item.standardName?.toLowerCase().includes(searchQuery.toLowerCase()),
       );
     }
 
@@ -899,7 +1470,8 @@ const ManageDriftPage = () => {
   const filteredAcceptedItems = applyFilters(acceptedDeviationItemsWithActions);
   const filteredCustomerSpecificItems = applyFilters(customerSpecificDeviationItemsWithActions);
   const filteredDeniedItems = applyFilters(deniedDeviationItemsWithActions);
-  const filteredAlignedItems = applyFilters(alignedStandardItems);
+  const filteredAlignedItems = applyFilters(allAlignedItems);
+  const filteredLicenseSkippedItems = applyFilters(licenseSkippedItems);
 
   // Helper function to render items grouped by category when category sort is active
   const renderItemsByCategory = (items) => {
@@ -973,76 +1545,7 @@ const ManageDriftPage = () => {
       ? driftTemplateOptions.find((option) => option.value === templateId) || null
       : null;
   const title = "Manage Drift";
-  const subtitle = [
-    {
-      icon: <Policy />,
-      text: (
-        <CippAutoComplete
-          options={driftTemplateOptions}
-          label="Select Drift Template"
-          multiple={false}
-          creatable={false}
-          isFetching={standardsApi.isFetching}
-          defaultValue={selectedTemplateOption}
-          value={selectedTemplateOption}
-          onChange={(selectedTemplate) => {
-            const query = { ...router.query };
-            if (selectedTemplate && selectedTemplate.value) {
-              query.templateId = selectedTemplate.value;
-            } else {
-              delete query.templateId;
-            }
-            router.replace(
-              {
-                pathname: router.pathname,
-                query: query,
-              },
-              undefined,
-              { shallow: true }
-            );
-          }}
-          sx={{ minWidth: 300 }}
-          placeholder="Select a drift template..."
-        />
-      ),
-    },
-    // Add compliance badges when data is available
-    ...(totalPolicies > 0
-      ? [
-          {
-            component: (
-              <Stack alignItems="center" flexWrap="wrap" direction="row" spacing={2}>
-                <Chip
-                  icon={
-                    <SvgIcon fontSize="small">
-                      <FactCheck />
-                    </SvgIcon>
-                  }
-                  label={`${compliancePercentage}% Compliant`}
-                  variant="outlined"
-                  size="small"
-                  color={
-                    compliancePercentage === 100
-                      ? "success"
-                      : compliancePercentage >= 50
-                      ? "warning"
-                      : "error"
-                  }
-                />
-                <Chip
-                  label={`${combinedScore}% Combined Score`}
-                  variant="outlined"
-                  size="small"
-                  color={
-                    combinedScore >= 80 ? "success" : combinedScore >= 60 ? "warning" : "error"
-                  }
-                />
-              </Stack>
-            ),
-          },
-        ]
-      : []),
-  ];
+  const subtitle = [];
 
   return (
     <HeaderedTabbedLayout
@@ -1143,6 +1646,12 @@ const ManageDriftPage = () => {
                         variant="outlined"
                       />
                     </Box>
+                    <Box display="flex" justifyContent="space-between" alignItems="center">
+                      <Typography variant="body2" color="text.secondary">
+                        Skipped (No License)
+                      </Typography>
+                      <Chip label={licenseSkippedItems.length} size="small" variant="outlined" />
+                    </Box>
                     <Divider />
                     <Box display="flex" justifyContent="space-between" alignItems="center">
                       <Typography variant="body2" fontWeight={600}>
@@ -1161,12 +1670,58 @@ const ManageDriftPage = () => {
                         variant="outlined"
                       />
                     </Box>
+                    <Box display="flex" justifyContent="space-between" alignItems="center">
+                      <Typography variant="body2" fontWeight={600}>
+                        Total Score
+                      </Typography>
+                      <Chip
+                        label={`${combinedScore}%`}
+                        size="small"
+                        color={
+                          combinedScore === 100
+                            ? "success"
+                            : combinedScore >= 80
+                              ? "warning"
+                              : combinedScore >= 30
+                                ? "warning"
+                                : "error"
+                        }
+                        variant="outlined"
+                      />
+                    </Box>
                   </Stack>
                 </CippButtonCard>
 
                 {/* Filters Card */}
                 <CippButtonCard title="Filters">
                   <Stack spacing={2}>
+                    <CippAutoComplete
+                      options={driftTemplateOptions}
+                      label="Select Drift Template"
+                      multiple={false}
+                      creatable={false}
+                      isFetching={standardsApi.isFetching}
+                      defaultValue={selectedTemplateOption}
+                      value={selectedTemplateOption}
+                      onChange={(selectedTemplate) => {
+                        const query = { ...router.query };
+                        if (selectedTemplate && selectedTemplate.value) {
+                          query.templateId = selectedTemplate.value;
+                        } else {
+                          delete query.templateId;
+                        }
+                        router.replace(
+                          {
+                            pathname: router.pathname,
+                            query: query,
+                          },
+                          undefined,
+                          { shallow: true },
+                        );
+                      }}
+                      placeholder="Select a drift template..."
+                    />
+
                     <TextField
                       fullWidth
                       size="small"
@@ -1186,6 +1741,7 @@ const ManageDriftPage = () => {
                         { label: "Accepted", value: "accepted" },
                         { label: "Customer Specific", value: "customerspecific" },
                         { label: "Denied", value: "denied" },
+                        { label: "Compliant", value: "compliant" },
                       ]}
                       multiple={true}
                     />
@@ -1204,8 +1760,8 @@ const ManageDriftPage = () => {
                                 sortBy === "name"
                                   ? "Name"
                                   : sortBy === "status"
-                                  ? "Status"
-                                  : "Category",
+                                    ? "Status"
+                                    : "Category",
                               value: sortBy,
                             }
                           : null
@@ -1220,7 +1776,7 @@ const ManageDriftPage = () => {
 
             {/* Right side - Deviation Management */}
             <Grid size={{ xs: 12, md: 8 }}>
-              <Stack spacing={3}>
+              <Stack spacing={3} sx={{ pr: 2 }}>
                 {/* Current Deviations Section */}
                 {(!filterStatus ||
                   filterStatus.length === 0 ||
@@ -1266,7 +1822,7 @@ const ManageDriftPage = () => {
                                 (deviation.standardName?.includes("ConditionalAccessTemplate") ||
                                   deviation.standardName?.includes("IntuneTemplate")) &&
                                 deviation.expectedValue ===
-                                  "This policy only exists in the tenant, not in the template."
+                                  "This policy only exists in the tenant, not in the template.",
                             ) && (
                               <MenuItem onClick={() => handleBulkAction("deny-all-delete")}>
                                 <Block sx={{ mr: 1, color: "error.main" }} />
@@ -1328,14 +1884,36 @@ const ManageDriftPage = () => {
                     </Box>
                   )}
 
-                {/* Compliant Standards Section - Always shown, not affected by status filter */}
-                {filteredAlignedItems.length > 0 && (
+                {/* Compliant Standards Section - Only shown when filtered by All or Compliant */}
+                {(!filterStatus ||
+                  filterStatus.length === 0 ||
+                  filterStatus.some((f) => f.value === "all" || f.value === "compliant")) &&
+                  filteredAlignedItems.length > 0 && (
+                    <Box>
+                      <Typography variant="h6" sx={{ mb: 2 }}>
+                        Compliant Standards
+                      </Typography>
+                      <CippBannerListCard
+                        items={filteredAlignedItems}
+                        isCollapsible={true}
+                        layout={"single"}
+                        isFetching={driftApi.isFetching}
+                      />
+                    </Box>
+                  )}
+
+                {/* License Skipped Section - Always at the end */}
+                {filteredLicenseSkippedItems.length > 0 && (
                   <Box>
                     <Typography variant="h6" sx={{ mb: 2 }}>
-                      Compliant Standards
+                      Skipped - No License Available
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                      These standards were skipped because the required licenses are not available
+                      for this tenant.
                     </Typography>
                     <CippBannerListCard
-                      items={filteredAlignedItems}
+                      items={filteredLicenseSkippedItems}
                       isCollapsible={true}
                       layout={"single"}
                       isFetching={driftApi.isFetching}
@@ -1361,23 +1939,194 @@ const ManageDriftPage = () => {
           api={{
             url: "/api/ExecUpdateDriftDeviation",
             type: "POST",
-            data: {
-              deviations: "deviations",
-            },
+            postEntireRow: true,
             confirmText: `Are you sure you'd like to ${actionData.action?.text || "update"} ${
               actionData.action?.type === "single"
                 ? "this deviation"
                 : actionData.action?.type === "bulk"
-                ? `these ${actionData.action?.count || 0} deviations`
-                : actionData.action?.type === "reset"
-                ? "for this tenant"
-                : "this deviation"
+                  ? `these ${actionData.action?.count || 0} deviations`
+                  : actionData.action?.type === "reset"
+                    ? "for this tenant"
+                    : "this deviation"
             }?`,
           }}
           row={actionData.data}
           relatedQueryKeys={[`TenantDrift-${tenantFilter}`]}
         />
       )}
+
+      {/* Render all Menu components outside of card structure */}
+      {deviationItemsWithActions.map((item) => {
+        const supportsDelete =
+          (item.standardName?.includes("ConditionalAccessTemplate") ||
+            item.standardName?.includes("IntuneTemplate")) &&
+          item.expectedValue === "This policy only exists in the tenant, not in the template.";
+        return (
+          <Menu
+            key={`menu-${item.id}`}
+            anchorEl={anchorEl[item.id]}
+            open={Boolean(anchorEl[item.id])}
+            onClose={() => handleMenuClose(item.id)}
+          >
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("accept-customer-specific", item);
+                handleMenuClose(item.id);
+              }}
+            >
+              <CheckCircle sx={{ mr: 1, color: "success.main" }} />
+              Accept Deviation - Customer Specific
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("accept", item);
+                handleMenuClose(item.id);
+              }}
+            >
+              <Check sx={{ mr: 1, color: "info.main" }} />
+              Accept Deviation
+            </MenuItem>
+            {supportsDelete && (
+              <MenuItem
+                onClick={() => {
+                  handleDeviationAction("deny-delete", item);
+                  handleMenuClose(item.id);
+                }}
+              >
+                <Block sx={{ mr: 1, color: "error.main" }} />
+                Deny Deviation - Delete Policy
+              </MenuItem>
+            )}
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("deny-remediate", item);
+                handleMenuClose(item.id);
+              }}
+            >
+              <Cancel sx={{ mr: 1, color: "error.main" }} />
+              Deny Deviation - Remediate to align with template
+            </MenuItem>
+          </Menu>
+        );
+      })}
+
+      {acceptedDeviationItemsWithActions.map((item) => {
+        const supportsDelete =
+          (item.standardName?.includes("ConditionalAccessTemplate") ||
+            item.standardName?.includes("IntuneTemplate")) &&
+          item.expectedValue === "This policy only exists in the tenant, not in the template.";
+        return (
+          <Menu
+            key={`menu-accepted-${item.id}`}
+            anchorEl={anchorEl[`accepted-${item.id}`]}
+            open={Boolean(anchorEl[`accepted-${item.id}`])}
+            onClose={() => handleMenuClose(`accepted-${item.id}`)}
+          >
+            {supportsDelete && (
+              <MenuItem
+                onClick={() => {
+                  handleDeviationAction("deny-delete", item);
+                  handleMenuClose(`accepted-${item.id}`);
+                }}
+              >
+                <Block sx={{ mr: 1, color: "error.main" }} />
+                Deny - Delete Policy
+              </MenuItem>
+            )}
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("deny-remediate", item);
+                handleMenuClose(`accepted-${item.id}`);
+              }}
+            >
+              <Cancel sx={{ mr: 1, color: "error.main" }} />
+              Deny - Remediate to align with template
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("accept-customer-specific", item);
+                handleMenuClose(`accepted-${item.id}`);
+              }}
+            >
+              <CheckCircle sx={{ mr: 1, color: "info.main" }} />
+              Accept - Customer Specific
+            </MenuItem>
+          </Menu>
+        );
+      })}
+
+      {customerSpecificDeviationItemsWithActions.map((item) => {
+        const supportsDelete =
+          (item.standardName?.includes("ConditionalAccessTemplate") ||
+            item.standardName?.includes("IntuneTemplate")) &&
+          item.expectedValue === "This policy only exists in the tenant, not in the template.";
+        return (
+          <Menu
+            key={`menu-customer-${item.id}`}
+            anchorEl={anchorEl[`customer-${item.id}`]}
+            open={Boolean(anchorEl[`customer-${item.id}`])}
+            onClose={() => handleMenuClose(`customer-${item.id}`)}
+          >
+            {supportsDelete && (
+              <MenuItem
+                onClick={() => {
+                  handleDeviationAction("deny-delete", item);
+                  handleMenuClose(`customer-${item.id}`);
+                }}
+              >
+                <Block sx={{ mr: 1, color: "error.main" }} />
+                Deny - Delete
+              </MenuItem>
+            )}
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("deny-remediate", item);
+                handleMenuClose(`customer-${item.id}`);
+              }}
+            >
+              <Cancel sx={{ mr: 1, color: "error.main" }} />
+              Deny - Remediate to align with template
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                handleDeviationAction("accept", item);
+                handleMenuClose(`customer-${item.id}`);
+              }}
+            >
+              <Check sx={{ mr: 1, color: "success.main" }} />
+              Accept
+            </MenuItem>
+          </Menu>
+        );
+      })}
+
+      {deniedDeviationItemsWithActions.map((item) => (
+        <Menu
+          key={`menu-denied-${item.id}`}
+          anchorEl={anchorEl[`denied-${item.id}`]}
+          open={Boolean(anchorEl[`denied-${item.id}`])}
+          onClose={() => handleMenuClose(`denied-${item.id}`)}
+        >
+          <MenuItem
+            onClick={() => {
+              handleDeviationAction("accept", item);
+              handleMenuClose(`denied-${item.id}`);
+            }}
+          >
+            <Check sx={{ mr: 1, color: "success.main" }} />
+            Accept
+          </MenuItem>
+          <MenuItem
+            onClick={() => {
+              handleDeviationAction("accept-customer-specific", item);
+              handleMenuClose(`denied-${item.id}`);
+            }}
+          >
+            <CheckCircle sx={{ mr: 1, color: "info.main" }} />
+            Accept - Customer Specific
+          </MenuItem>
+        </Menu>
+      ))}
 
       {/* Hidden ExecutiveReportButton that gets triggered programmatically */}
       <Box sx={{ position: "absolute", top: -9999, left: -9999 }}>
